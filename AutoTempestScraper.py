@@ -1,7 +1,6 @@
 import asyncio
 import os
-import time
-from pickle import LIST
+import random
 
 import pandas as pd
 from playwright.async_api import async_playwright
@@ -55,41 +54,51 @@ async def main():
             print(f"\n=== Starting scraping for {car[0]} {car[1]} ===")
             # ---------------- Navigate to a car listings for each make and model ----------------
             await page.goto("https://www.autotempest.com/")
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(random.randint(700, 1400))
 
             # Selecting the "Price Trends Option"
             await page.locator('li[data-id="price-trends-main"]').click()
-            await page.wait_for_timeout(300)
+            await page.wait_for_timeout(random.randint(500, 1000))
 
             # Now we will input the car model and make
             await page.locator("#trends-make-input").fill(car[0])
             await page.locator("#trends-make-input").press("Enter")
-            await page.wait_for_timeout(300)
+            await page.wait_for_timeout(random.randint(400, 900))
             await page.locator("#trends-model-input").fill(car[1])
             await page.locator("#trends-model-input").press("Enter")
-            await page.wait_for_timeout(300)
+            await page.wait_for_timeout(random.randint(400, 900))
 
             # Clicking the Search button
             await page.get_by_role("button", name="Search").first.click()
-            await page.wait_for_timeout(1000)
+            await page.wait_for_timeout(random.randint(1200, 2000))
 
             print("Search button pressed")
 
             # Wait for the page to load
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(random.randint(2500, 4000))
 
-            # Switching from sample data to all data
+            # Switching from sample data to all data (if present)
             # The button has text "Sampled Data"
-            await page.locator("text=Sampled Data").click()
-            await page.wait_for_timeout(500)
+            sampled_btn = page.locator("text=Sampled Data")
+            if await sampled_btn.is_visible():
+                await sampled_btn.click()
+                await page.wait_for_timeout(random.randint(600, 1200))
+            else:
+                print("Sampled Data toggle not visible; continuing with defaults.")
 
             # Set the slider to 100%
             slider = page.locator('span[role="slider"]')
             await slider.focus()
             await slider.press("End")
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(random.randint(600, 1200))
 
+            # Per-model tracking counters
             num_more_results = 0
+            processed_count = 0
+            saved_this_model = 0
+            skipped_no_id = 0
+            skipped_no_href = 0
+            skipped_duplicates = 0
             while num_more_results < MAX_PAGES_PER_MODEL:
                 local_results = []
                 # ---------------- Getting a list of all listings ----------------
@@ -101,7 +110,7 @@ async def main():
                     )  # 10s wait for at least one result
                 except:
                     print(f"Initial results failed to load for {car[0]} {car[1]}")
-                    continue  # Skip this model
+                    break  # Stop pagination for this model
                 car_elements = page.locator(".ResultItem_cardWrap__tA63Q")
                 cars = await car_elements.all()
 
@@ -113,11 +122,24 @@ async def main():
                     listing_url = f"https://www.autotempest.com{href}" if href else None
                     listing_id = await car_elem.locator("..").get_attribute("id")
 
-                    if (
-                        listing_id in seen_ids
-                        or len(local_results) >= MAX_PAGES_PER_MODEL
-                    ):
-                        # print(f"Skipping already seen ID: {listing_id}")
+                    processed_count += 1
+
+                    # Guard: missing ID
+                    if not listing_id:
+                        skipped_no_id += 1
+                        print("Skipping listing: missing id")
+                        continue
+
+                    # Guard: missing href/url
+                    if not href:
+                        skipped_no_href += 1
+                        print(f"Skipping listing {listing_id}: missing href")
+                        continue
+
+                    # Duplicate check
+                    if listing_id in seen_ids:
+                        skipped_duplicates += 1
+                        print(f"Skipping duplicate listing id={listing_id}")
                         continue
 
                     # parent_html = await car_elem.locator("..").inner_html()
@@ -129,15 +151,25 @@ async def main():
                     print(f"Listing URL: {listing_url}")
                     print("\n")
 
-                    local_results.append({"id": listing_id, "url": listing_url})
+                    local_results.append(
+                        {
+                            "make": car[0],
+                            "model": car[1],
+                            "id": listing_id,
+                            "url": listing_url,
+                        }
+                    )
                     seen_ids.add(listing_id)
 
                 # Writing the data to a file
                 if local_results:
+                    # Ensure output directory exists
+                    os.makedirs(os.path.dirname(LISTING_URL_CSV), exist_ok=True)
                     header = not os.path.exists(LISTING_URL_CSV)
                     pd.DataFrame(local_results).to_csv(
                         LISTING_URL_CSV, mode="a", header=header, index=False
                     )
+                    saved_this_model += len(local_results)
                     print(
                         f"Saved {len(local_results)} new listings to {LISTING_URL_CSV}"
                     )
@@ -156,19 +188,24 @@ async def main():
                 # Click the button and robustly wait for more results to load
                 prev_count = await page.locator(".ResultItem_cardWrap__tA63Q").count()
                 await more_button.click()
-                await page.wait_for_timeout(1000)  # Short pause for human-like behavior
+                await page.wait_for_timeout(
+                    random.randint(1200, 2500)
+                )  # Short pause for human-like behavior
                 try:
                     await page.wait_for_function(
                         "(arg) => document.querySelectorAll(arg.sel).length > arg.prev",
-                        {"sel": ".ResultItem_cardWrap__tA63Q", "prev": prev_count},
+                        arg={"sel": ".ResultItem_cardWrap__tA63Q", "prev": prev_count},
                         timeout=10000,
                     )
                 except Exception as e:
                     print(f"No new results detected after clicking More Results: {e}")
                     break
                 num_more_results += 1
-            # Wait for the page to load
-            await page.wait_for_timeout(5000)
+            # Per-model summary logging
+            print(
+                f"Summary for {car[0]} {car[1]} -> processed: {processed_count}, saved: {saved_this_model}, skipped_no_id: {skipped_no_id}, skipped_no_href: {skipped_no_href}, skipped_duplicates: {skipped_duplicates}, more_results_clicks: {num_more_results}"
+            )
+            await page.wait_for_timeout(random.randint(6000, 9000))
 
     # Close browser
     await browser.close()
