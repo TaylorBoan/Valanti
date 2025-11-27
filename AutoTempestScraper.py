@@ -18,6 +18,7 @@ async def main():
             slow_mo=100,
         )
         page = await browser.new_page()
+        page.set_default_timeout(15000)
 
         # Load seen IDs from existing CSV if it exists
         seen_ids = set()
@@ -106,23 +107,218 @@ async def main():
                 # Wait for results to update (instead of just sleep)
                 try:
                     await page.wait_for_selector(
-                        ".ResultItem_cardWrap__tA63Q", timeout=10000
-                    )  # 10s wait for at least one result
+                        ".ResultItem_cardWrap__tA63Q", timeout=8000
+                    )  # 8s wait for at least one result
                 except:
                     print(f"Initial results failed to load for {car[0]} {car[1]}")
                     break  # Stop pagination for this model
-                car_elements = page.locator(".ResultItem_cardWrap__tA63Q")
-                cars = await car_elements.all()
+                # Ensure we are at the top to keep all virtualized items visible
+                await page.evaluate("window.scrollTo(0, 0)")
+                await page.wait_for_timeout(150)
+                # Select result card elements
+                try:
+                    filtered = page.locator(".ResultItem_cardWrap__tA63Q:has(h3 a)")
+                    filtered_count = await filtered.count()
+                    if filtered_count > 0:
+                        car_elements = filtered
+                        print(
+                            f"Using filtered result selector (:has(h3 a)). count={filtered_count}"
+                        )
+                    else:
+                        car_elements = page.locator(".ResultItem_cardWrap__tA63Q")
+                        print(
+                            "Using base result selector (.ResultItem_cardWrap__tA63Q)."
+                        )
+                except Exception:
+                    car_elements = page.locator(".ResultItem_cardWrap__tA63Q")
+                    print("Using base result selector due to :has() unsupported.")
+                count = await car_elements.count()
+                print(f"Found {count} result containers on current page")
 
                 # ---------------- Extract the URL from each listing ----------------
-                for car_elem in cars:
-                    # Getting the URL for each listing to be saved and then visited later:
-                    link_elem = car_elem.locator("h3 a")  # Find <a> inside <h3>
-                    href = await link_elem.get_attribute("href")
-                    listing_url = f"https://www.autotempest.com{href}" if href else None
-                    listing_id = await car_elem.locator("..").get_attribute("id")
+                # Build a stable snapshot of elements to iterate to avoid index drift
+                items = []
+                cards_snapshot = None
+                try:
+                    cards_snapshot = await page.evaluate(
+                        """Array.from(document.querySelectorAll('.ResultItem_cardWrap__tA63Q')).map((el, idx) => {
+                            const withId = el.closest('[id]');
+                            return { idx, ancestorId: withId ? withId.id : null };
+                        })"""
+                    )
+                    print(f"Captured card snapshot (len={len(cards_snapshot)})")
+                except Exception:
+                    cards_snapshot = None
+                if cards_snapshot and len(cards_snapshot) > 0:
+                    for entry in cards_snapshot:
+                        idx = entry.get("idx")
+                        ancestor_id = entry.get("ancestorId")
+                        if ancestor_id:
+                            items.append(
+                                (
+                                    idx,
+                                    page.locator(
+                                        f'[id="{ancestor_id}"] .ResultItem_cardWrap__tA63Q'
+                                    ).first,
+                                    ancestor_id,
+                                )
+                            )
+                        else:
+                            items.append((idx, car_elements.nth(idx), None))
+                else:
+                    for idx in range(count):
+                        items.append((idx, car_elements.nth(idx), None))
 
+                for i, car_elem, stable_ancestor_id in items:
                     processed_count += 1
+                    # Detachment guard
+                    try:
+                        is_detached = await car_elem.count() == 0
+                    except Exception as e:
+                        print(f"=== Card #{i} count() failed ({e}). Skipping. ===")
+                        continue
+                    if is_detached:
+                        print(f"=== Card #{i} is detached (0 matches). Skipping. ===")
+                        continue
+                    # Make sure virtualized items are realized
+                    try:
+                        await car_elem.scroll_into_view_if_needed()
+                    except Exception:
+                        pass
+
+                    direct_href = None
+                    link_elem = car_elem.locator("h3 a")  # Find <a> inside <h3>
+                    # Ensure we have a usable link; try fallbacks when missing
+                    if await link_elem.count() == 0:
+                        # Try fallback selectors before skipping
+                        fallback_selector = None
+                        for sel in [
+                            "a.ResultItem_titleLink__Ty_Xt",
+                            "a.ResultItem_thumbnailLink__tl3uL",
+                            "a:has-text('View Listing')",
+                            "h3 >> a",
+                            "a[href*='/trends/']",
+                            "a[href]",
+                        ]:
+                            cand = car_elem.locator(sel)
+                            if await cand.count() > 0:
+                                link_elem = cand.first
+                                fallback_selector = sel
+                                print(
+                                    f"[card #{i}] primary link missing; using fallback selector: {sel}"
+                                )
+                                break
+                        # Try DOM evaluation to find a likely link if no selector worked
+                        if not fallback_selector:
+                            try:
+                                direct_href = await car_elem.evaluate(
+                                    """(el) => {
+                                        const anchors = Array.from(el.querySelectorAll('a[href]'));
+                                        const prefer = anchors.find(a => (a.getAttribute('href') || '').includes('/trends/'));
+                                        const target = prefer || anchors[0];
+                                        return target ? target.getAttribute('href') : null;
+                                    }"""
+                                )
+                            except Exception:
+                                direct_href = None
+                        if not fallback_selector and not direct_href:
+                            skipped_no_href += 1
+                            # Detailed, digestible debug for cards without a usable link
+                            try:
+                                cid = await car_elem.get_attribute("id")
+                            except Exception:
+                                cid = None
+                            try:
+                                cclass = await car_elem.get_attribute("class")
+                            except Exception:
+                                cclass = None
+                            try:
+                                parent_id = await car_elem.evaluate(
+                                    "(el) => el.parentElement && el.parentElement.id"
+                                )
+                                parent_class = await car_elem.evaluate(
+                                    "(el) => el.parentElement && el.parentElement.className"
+                                )
+                            except Exception:
+                                parent_id = None
+                                parent_class = None
+                            try:
+                                text_snippet = await car_elem.inner_text()
+                                if text_snippet:
+                                    text_snippet = text_snippet.strip().replace(
+                                        "\n", " "
+                                    )[:300]
+                            except Exception:
+                                text_snippet = None
+                            try:
+                                child_tags = await car_elem.evaluate(
+                                    "(el) => Array.from(new Set(Array.from(el.querySelectorAll('*')).map(e => e.tagName))).slice(0,20)"
+                                )
+                            except Exception:
+                                child_tags = None
+                            try:
+                                anchors_info = await car_elem.evaluate(
+                                    """(el) => Array.from(el.querySelectorAll('a')).slice(0,10).map(a => ({ text: (a.textContent || '').trim().slice(0,80), href: a.getAttribute('href') }))"""
+                                )
+                            except Exception:
+                                anchors_info = None
+                            try:
+                                outer_snippet = await car_elem.evaluate(
+                                    "(el) => el.outerHTML.slice(0, 500)"
+                                )
+                            except Exception:
+                                outer_snippet = None
+                            print(
+                                "============================================================"
+                            )
+                            print(f"[Skip] Card #{i}: no usable link")
+                            print(f"  id           : {cid}")
+                            print(f"  class        : {cclass}")
+                            print(f"  parent.id    : {parent_id}")
+                            print(f"  parent.class : {parent_class}")
+                            print(f"  child_tags   : {child_tags}")
+                            if text_snippet:
+                                print(f"  text         : {text_snippet}")
+                            if anchors_info:
+                                for j, a in enumerate(anchors_info):
+                                    try:
+                                        print(
+                                            f"  anchor[{j}]    : text='{a.get('text')}', href='{a.get('href')}'"
+                                        )
+                                    except Exception:
+                                        pass
+                            if outer_snippet:
+                                print(f"  outer_html   : {outer_snippet}")
+                            print(
+                                "------------------------------------------------------------"
+                            )
+                            continue
+
+                    # Get href with a short timeout or use direct href found via evaluation
+                    href = direct_href if direct_href else None
+                    if href is None:
+                        try:
+                            href = await link_elem.first.get_attribute(
+                                "href", timeout=2000
+                            )
+                        except Exception:
+                            href = None
+                    listing_url = f"https://www.autotempest.com{href}" if href else None
+
+                    # Try to get id from the element first, then from its parent
+                    listing_id = await car_elem.get_attribute("id")
+                    if not listing_id:
+                        try:
+                            listing_id = await car_elem.locator("..").get_attribute(
+                                "id"
+                            )
+                        except Exception:
+                            listing_id = None
+                    # Fallback: if iterating wrapper ids, prefer the snapshot id
+                    if not listing_id and stable_ancestor_id:
+                        listing_id = stable_ancestor_id
+
+                    # processed_count increment moved to loop start
 
                     # Guard: missing ID
                     if not listing_id:
@@ -141,11 +337,6 @@ async def main():
                         skipped_duplicates += 1
                         print(f"Skipping duplicate listing id={listing_id}")
                         continue
-
-                    # parent_html = await car_elem.locator("..").inner_html()
-                    # print(
-                    #     f"Parent HTML snippet: {parent_html[:500]}..."
-                    # )  # First 500 chars to see the id and structure
 
                     print(f"Listing ID: {listing_id}")
                     print(f"Listing URL: {listing_url}")
@@ -182,11 +373,20 @@ async def main():
                     not await more_button.is_visible()
                     or not await more_button.is_enabled()
                 ):
-                    print("More Results button not visible/enabled. Stopping.")
+                    current_total = await page.locator(
+                        ".ResultItem_cardWrap__tA63Q"
+                    ).count()
+                    print(
+                        f"More Results button not visible/enabled. Stopping at {current_total} total cards."
+                    )
                     break  # Exit if button is hidden or missing
 
                 # Click the button and robustly wait for more results to load
-                prev_count = await page.locator(".ResultItem_cardWrap__tA63Q").count()
+                sel = ".ResultItem_cardWrap__tA63Q"
+                prev_count = await page.locator(sel).count()
+                print(
+                    f"Clicking More Results (prev_count={prev_count}, clicks_so_far={num_more_results})"
+                )
                 await more_button.click()
                 await page.wait_for_timeout(
                     random.randint(1200, 2500)
@@ -194,12 +394,14 @@ async def main():
                 try:
                     await page.wait_for_function(
                         "(arg) => document.querySelectorAll(arg.sel).length > arg.prev",
-                        arg={"sel": ".ResultItem_cardWrap__tA63Q", "prev": prev_count},
-                        timeout=10000,
+                        arg={"sel": sel, "prev": prev_count},
+                        timeout=8000,
                     )
                 except Exception as e:
                     print(f"No new results detected after clicking More Results: {e}")
                     break
+                new_count = await page.locator(sel).count()
+                print(f"After More Results: new_count={new_count}")
                 num_more_results += 1
             # Per-model summary logging
             print(
