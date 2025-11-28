@@ -9,6 +9,7 @@ from playwright.async_api import async_playwright
 CAR_MODELS_CSV = "./Car Models/cars.csv"
 LISTING_URL_CSV = "./Car Models/listing_urls.csv"
 MAX_PAGES_PER_MODEL = 1000
+SAFE_OVERLAP = 5  # Number of previous indices to reprocess each page for safety
 
 
 async def main():
@@ -37,7 +38,6 @@ async def main():
 
                 # Printing the number of found ids
                 print(f"Loaded {len(seen_ids)} seen IDs from {LISTING_URL_CSV}")
-                print(f"Found {len(seen_ids)} seen IDs from {LISTING_URL_CSV}")
 
             except Exception as e:
                 print(f"Error loading {LISTING_URL_CSV}: {e}")
@@ -99,12 +99,17 @@ async def main():
             await page.wait_for_timeout(random.randint(600, 1200))
 
             # Per-model tracking counters
-            num_more_results = 0
-            processed_count = 0
-            saved_this_model = 0
-            skipped_no_id = 0
-            skipped_no_href = 0
-            skipped_duplicates = 0
+            num_more_results = 0  # The number of pages processed for each model
+            processed_count = 0  # The number of listings processed for each model
+            saved_this_model = 0  # The number of listings saved for each model
+            skipped_no_id = 0  # The number of listings skipped due to missing ID
+            skipped_no_href = 0  # The number of listings skipped due to missing href
+            skipped_duplicates = 0  # The number of listings skipped due to duplicates
+            seen_dom_ids_this_model = set()  # Initialize a set to track seen DOM IDs for this model. This can include non-saved elements.
+            seen_hrefs_this_model = (
+                set()
+            )  # Initialize a set to track seen hrefs for this model
+            last_processed_idx = -1  # Track highest processed index for safe-overlap pagination. It starts at -1 to ensure the first page is processed.
             while num_more_results < MAX_PAGES_PER_MODEL:
                 local_results = []
                 # ---------------- Getting a list of all listings ----------------
@@ -139,6 +144,12 @@ async def main():
                     print("Using base result selector due to :has() unsupported.")
                 count = await car_elements.count()
                 print(f"Found {count} result containers on current page")
+                # Compute start index with safe overlap window
+                start_index = max(0, last_processed_idx - SAFE_OVERLAP)
+                if start_index > 0:
+                    print(
+                        f"[Pagination] Using start_index={start_index} (last_processed_idx={last_processed_idx}, overlap={SAFE_OVERLAP})"
+                    )
 
                 # ---------------- Extract the URL from each listing ----------------
                 # Build a stable snapshot of elements to iterate to avoid index drift
@@ -158,6 +169,9 @@ async def main():
                     for entry in cards_snapshot:
                         idx = entry.get("idx")
                         ancestor_id = entry.get("ancestorId")
+                        # Only process newly appended indices with a small safe overlap
+                        if idx is None or idx < start_index:
+                            continue
                         if ancestor_id:
                             items.append(
                                 (
@@ -171,7 +185,7 @@ async def main():
                         else:
                             items.append((idx, car_elements.nth(idx), None))
                 else:
-                    for idx in range(count):
+                    for idx in range(start_index, count):
                         items.append((idx, car_elements.nth(idx), None))
 
                 for i, car_elem, stable_ancestor_id in items:
@@ -191,6 +205,41 @@ async def main():
                         await car_elem.scroll_into_view_if_needed()
                     except Exception:
                         pass
+
+                    # Early ID extraction and duplicate check to avoid re-processing
+                    listing_id = None
+                    try:
+                        listing_id = await car_elem.get_attribute("id")
+                    except Exception:
+                        listing_id = None
+                    if not listing_id:
+                        try:
+                            listing_id = await car_elem.locator("..").get_attribute(
+                                "id"
+                            )
+                        except Exception:
+                            listing_id = None
+                    if not listing_id and stable_ancestor_id:
+                        listing_id = stable_ancestor_id
+                    # Guard: missing ID (skip early to avoid churn re-processing)
+                    if not listing_id:
+                        skipped_no_id += 1
+                        print(f"[Skip] Card #{i}: missing id")
+                        continue
+                    # Skip if we've already seen this ID in this model or previously
+                    if listing_id in seen_dom_ids_this_model:
+                        skipped_duplicates += 1
+                        print(
+                            f"[Skip] Card #{i} id={listing_id}: duplicate within this model (DOM churn)"
+                        )
+                        continue
+                    if listing_id in seen_ids:
+                        skipped_duplicates += 1
+                        print(
+                            f"[Skip] Card #{i} id={listing_id}: duplicate from previous runs"
+                        )
+                        continue
+                    seen_dom_ids_this_model.add(listing_id)
 
                     direct_href = None
                     link_elem = car_elem.locator("h3 a")  # Find <a> inside <h3>
@@ -311,24 +360,7 @@ async def main():
                             href = None
                     listing_url = f"https://www.autotempest.com{href}" if href else None
 
-                    # Try to get id from the element first, then from its parent
-                    listing_id = await car_elem.get_attribute("id")
-                    if not listing_id:
-                        try:
-                            listing_id = await car_elem.locator("..").get_attribute(
-                                "id"
-                            )
-                        except Exception:
-                            listing_id = None
-                    # Fallback: if iterating wrapper ids, prefer the snapshot id
-                    if not listing_id and stable_ancestor_id:
-                        listing_id = stable_ancestor_id
-
-                    # Guard: missing ID
-                    if not listing_id:
-                        skipped_no_id += 1
-                        print("Skipping listing: missing id")
-                        continue
+                    # listing_id already determined by early duplicate check above
 
                     # Guard: missing href/url
                     if not href:
@@ -336,11 +368,14 @@ async def main():
                         print(f"Skipping listing {listing_id}: missing href")
                         continue
 
-                    # Duplicate check
-                    if listing_id in seen_ids:
+                    # Href-based per-model dedupe to mitigate DOM churn
+                    if href in seen_hrefs_this_model:
                         skipped_duplicates += 1
-                        print(f"Skipping duplicate listing id={listing_id}")
+                        print(
+                            f"[Skip] Card #{i} id={listing_id}: duplicate href on this model page ({href})"
+                        )
                         continue
+                    seen_hrefs_this_model.add(href)
 
                     print(f"Listing ID: {listing_id}")
                     print(f"Listing URL: {listing_url}")
@@ -356,7 +391,8 @@ async def main():
                     )
                     seen_ids.add(listing_id)
 
-                # Writing the data to a file
+                # Update last_processed_idx for next iteration and write the data to a file
+                last_processed_idx = count - 1
                 if local_results:
                     # Ensure output directory exists
                     os.makedirs(os.path.dirname(LISTING_URL_CSV), exist_ok=True)
@@ -406,6 +442,10 @@ async def main():
                     break
                 new_count = await page.locator(sel).count()
                 print(f"After More Results: new_count={new_count}")
+                # Next loop will use last_processed_idx computed from the page we just processed
+                print(
+                    f"[Pagination] last_processed_idx={last_processed_idx} (prior count processed)"
+                )
                 num_more_results += 1
                 # Session pagination logging
                 elapsed = time.time() - session_start
