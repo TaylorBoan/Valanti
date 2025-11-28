@@ -55,8 +55,9 @@ async def main():
 
         # Creating a list of car models and makes
         car_models_makes = list(zip(car_makes, car_models))
+        total_models = len(car_models_makes)
 
-        for car in car_models_makes:
+        for model_index, car in enumerate(car_models_makes, start=1):
             print(f"\n=== Starting scraping for {car[0]} {car[1]} ===")
             # ---------------- Navigate to a car listings for each make and model ----------------
             await page.goto("https://www.autotempest.com/")
@@ -473,6 +474,11 @@ async def main():
             print(
                 f"Summary for {car[0]} {car[1]} -> processed: {processed_count}, saved: {saved_this_model}, skipped_no_id: {skipped_no_id}, skipped_no_href: {skipped_no_href}, skipped_duplicates: {skipped_duplicates}, more_results_clicks: {num_more_results}"
             )
+            # Progress bar for models
+            bar_width = 30
+            filled = int(bar_width * model_index / total_models) if total_models else 0
+            bar = "#" * filled + "-" * (bar_width - filled)
+            print(f"[Progress] [{bar}] {model_index}/{total_models} models completed")
             await page.wait_for_timeout(random.randint(6000, 9000))
 
     # Close browser
