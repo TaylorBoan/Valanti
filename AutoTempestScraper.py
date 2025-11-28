@@ -1,6 +1,7 @@
 import asyncio
 import os
 import random
+import time
 
 import pandas as pd
 from playwright.async_api import async_playwright
@@ -19,6 +20,10 @@ async def main():
         )
         page = await browser.new_page()
         page.set_default_timeout(15000)
+
+        # Session-level metrics
+        session_start = time.time()
+        session_seen_count = 0
 
         # Load seen IDs from existing CSV if it exists
         seen_ids = set()
@@ -171,6 +176,7 @@ async def main():
 
                 for i, car_elem, stable_ancestor_id in items:
                     processed_count += 1
+                    session_seen_count += 1
                     # Detachment guard
                     try:
                         is_detached = await car_elem.count() == 0
@@ -318,8 +324,6 @@ async def main():
                     if not listing_id and stable_ancestor_id:
                         listing_id = stable_ancestor_id
 
-                    # processed_count increment moved to loop start
-
                     # Guard: missing ID
                     if not listing_id:
                         skipped_no_id += 1
@@ -403,6 +407,16 @@ async def main():
                 new_count = await page.locator(sel).count()
                 print(f"After More Results: new_count={new_count}")
                 num_more_results += 1
+                # Session pagination logging
+                elapsed = time.time() - session_start
+                time_per_listing = (
+                    (elapsed / session_seen_count)
+                    if session_seen_count > 0
+                    else float("inf")
+                )
+                print(
+                    f"[Session] Elapsed: {elapsed:.2f}s | Listings seen: {session_seen_count} | Time/listing: {time_per_listing:.2f}s"
+                )
             # Per-model summary logging
             print(
                 f"Summary for {car[0]} {car[1]} -> processed: {processed_count}, saved: {saved_this_model}, skipped_no_id: {skipped_no_id}, skipped_no_href: {skipped_no_href}, skipped_duplicates: {skipped_duplicates}, more_results_clicks: {num_more_results}"
