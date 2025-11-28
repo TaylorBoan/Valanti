@@ -9,7 +9,7 @@ from playwright.async_api import async_playwright
 CAR_MODELS_CSV = "./Car Models/cars.csv"
 LISTING_URL_CSV = "./Car Models/listing_urls.csv"
 MAX_PAGES_PER_MODEL = 1000
-SAFE_OVERLAP = 5  # Number of previous indices to reprocess each page for safety
+SAFE_OVERLAP = 15  # Number of previous indices to reprocess each page for safety
 
 
 async def main():
@@ -106,9 +106,7 @@ async def main():
             skipped_no_href = 0  # The number of listings skipped due to missing href
             skipped_duplicates = 0  # The number of listings skipped due to duplicates
             seen_dom_ids_this_model = set()  # Initialize a set to track seen DOM IDs for this model. This can include non-saved elements.
-            seen_hrefs_this_model = (
-                set()
-            )  # Initialize a set to track seen hrefs for this model
+            seen_hrefs_this_model = set()  # Initialize a set to track seen hrefs for this model. This can include non-saved elements.
             last_processed_idx = -1  # Track highest processed index for safe-overlap pagination. It starts at -1 to ensure the first page is processed.
             while num_more_results < MAX_PAGES_PER_MODEL:
                 local_results = []
@@ -120,30 +118,19 @@ async def main():
                         ".ResultItem_cardWrap__tA63Q", timeout=8000
                     )  # 8s wait for at least one result
                 except:
-                    print(f"Initial results failed to load for {car[0]} {car[1]}")
+                    print(f"Failed to load results for {car[0]} {car[1]}")
                     break  # Stop pagination for this model
+
                 # Ensure we are at the top to keep all virtualized items visible
                 await page.evaluate("window.scrollTo(0, 0)")
                 await page.wait_for_timeout(150)
+
                 # Select result card elements
-                try:
-                    filtered = page.locator(".ResultItem_cardWrap__tA63Q:has(h3 a)")
-                    filtered_count = await filtered.count()
-                    if filtered_count > 0:
-                        car_elements = filtered
-                        print(
-                            f"Using filtered result selector (:has(h3 a)). count={filtered_count}"
-                        )
-                    else:
-                        car_elements = page.locator(".ResultItem_cardWrap__tA63Q")
-                        print(
-                            "Using base result selector (.ResultItem_cardWrap__tA63Q)."
-                        )
-                except Exception:
-                    car_elements = page.locator(".ResultItem_cardWrap__tA63Q")
-                    print("Using base result selector due to :has() unsupported.")
+                car_elements = page.locator(".ResultItem_cardWrap__tA63Q")
+                print("Using base result selector (.ResultItem_cardWrap__tA63Q).")
+
                 count = await car_elements.count()
-                print(f"Found {count} result containers on current page")
+
                 # Compute start index with safe overlap window
                 start_index = max(0, last_processed_idx - SAFE_OVERLAP)
                 if start_index > 0:
@@ -226,6 +213,7 @@ async def main():
                         skipped_no_id += 1
                         print(f"[Skip] Card #{i}: missing id")
                         continue
+
                     # Skip if we've already seen this ID in this model or previously
                     if listing_id in seen_dom_ids_this_model:
                         skipped_duplicates += 1
@@ -239,7 +227,9 @@ async def main():
                             f"[Skip] Card #{i} id={listing_id}: duplicate from previous runs"
                         )
                         continue
-                    seen_dom_ids_this_model.add(listing_id)
+                    seen_dom_ids_this_model.add(
+                        listing_id
+                    )  # These are just seen ids, not neccesarily saved ids
 
                     direct_href = None
                     link_elem = car_elem.locator("h3 a")  # Find <a> inside <h3>
@@ -440,8 +430,30 @@ async def main():
                 except Exception as e:
                     print(f"No new results detected after clicking More Results: {e}")
                     break
-                new_count = await page.locator(sel).count()
-                print(f"After More Results: new_count={new_count}")
+
+                # Additional settle loop: wait for card count to stabilize
+                try:
+                    last_count = await page.locator(sel).count()
+                    stable_runs = 0
+                    max_polls = 10
+                    interval_ms = 150
+                    required_stable_runs = 2
+                    for _ in range(max_polls):
+                        await page.wait_for_timeout(interval_ms)
+                        curr = await page.locator(sel).count()
+                        if curr == last_count:
+                            stable_runs += 1
+                            if stable_runs >= required_stable_runs:
+                                break
+                        else:
+                            stable_runs = 0
+                            last_count = curr
+                    print(
+                        f"[Pagination] Settled count after More Results: {last_count}"
+                    )
+                except Exception:
+                    pass
+
                 # Next loop will use last_processed_idx computed from the page we just processed
                 print(
                     f"[Pagination] last_processed_idx={last_processed_idx} (prior count processed)"
