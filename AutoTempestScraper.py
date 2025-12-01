@@ -9,7 +9,25 @@ from playwright.async_api import async_playwright
 CAR_MODELS_CSV = "./Car Models/cars.csv"
 LISTING_URL_CSV = "./Car Models/listing_urls.csv"
 MAX_PAGES_PER_MODEL = 1000
-SAFE_OVERLAP = 15  # Number of previous indices to reprocess each page for safety
+MAX_HARVEST_BUFFER = 15000  # cap for in-memory id buffer
+# SAFE_OVERLAP removed; DOM processing is now target-id driven via network responses
+
+
+# ---- Pretty logging helpers ----
+def log_header(title: str):
+    print("\n" + "=" * 80)
+    print(f"{title}")
+    print("=" * 80)
+
+
+def log_kv(title: str, **kwargs):
+    kv = " | ".join(f"{k}={v}" for k, v in kwargs.items())
+    print(f"{title} {kv}")
+
+
+def log_gap(lines: int = 1):
+    for _ in range(max(1, lines)):
+        print()
 
 
 async def main():
@@ -21,23 +39,115 @@ async def main():
         )
         page = await browser.new_page()
         page.set_default_timeout(15000)
+        # Attach a network response harvester to collect full records and target ids
+        records_by_id = {}
+        harvested_buffer = []
+        harvest_by_epoch = {}  # epoch -> list of harvested ids
+        processed_target_ids = set()  # ids we've already used to process cards
+        current_epoch = 0  # incremented before each "More Results" click
+        dom_deltas_by_epoch = {}  # epoch -> set of absolute hrefs discovered via DOM diff
+        collect_network = False  # do not harvest network data until after Search
+
+        async def _walk_collect(obj):
+            try:
+                if isinstance(obj, dict):
+                    if isinstance(obj.get("id"), str):
+                        records_by_id[obj["id"]] = obj
+                    for v in obj.values():
+                        await _walk_collect(v)
+                elif isinstance(obj, list):
+                    for v in obj:
+                        await _walk_collect(v)
+            except Exception:
+                pass
+
+        async def _handle_response(resp):
+            try:
+                ctype = resp.headers.get("content-type", "")
+            except Exception:
+                ctype = ""
+            if ctype and "application/json" in ctype:
+                url = getattr(resp, "url", "")
+                # Gate network harvesting to trends endpoint only
+                if "/api/trends/results" not in url:
+                    return
+                if not collect_network:
+                    return
+                try:
+                    data = await resp.json()
+                except Exception:
+                    data = None
+                if data is not None:
+                    # Extract ids only from this response payload
+                    def _collect_ids(obj, out):
+                        if isinstance(obj, dict):
+                            _id = obj.get("id")
+                            if isinstance(_id, str):
+                                out.append(_id)
+                            for v in obj.values():
+                                _collect_ids(v, out)
+                        elif isinstance(obj, list):
+                            for v in obj:
+                                _collect_ids(v, out)
+
+                    resp_ids = []
+                    try:
+                        # Prefer ids from trends payload shape: data.results[*].id
+                        if isinstance(data, dict) and isinstance(
+                            data.get("results"), list
+                        ):
+                            resp_ids = [
+                                r.get("id")
+                                for r in data["results"]
+                                if isinstance(r, dict) and isinstance(r.get("id"), str)
+                            ]
+                        else:
+                            _collect_ids(data, resp_ids)
+                    except Exception:
+                        resp_ids = []
+                    await _walk_collect(data)
+                    try:
+                        new_ids = resp_ids
+                        if new_ids:
+                            harvested_buffer.extend(new_ids)
+                            if len(harvested_buffer) > MAX_HARVEST_BUFFER:
+                                harvested_buffer[:] = harvested_buffer[
+                                    -MAX_HARVEST_BUFFER:
+                                ]
+                            harvest_by_epoch.setdefault(current_epoch, []).extend(
+                                new_ids
+                            )
+                        log_kv(
+                            "[Network]",
+                            epoch=current_epoch,
+                            url=getattr(resp, "url", ""),
+                            ctype=ctype,
+                            ids_in_resp=len(resp_ids),
+                        )
+                        print(f"  sample_ids={resp_ids[:5]}")
+                        log_gap()
+                    except Exception as e:
+                        log_kv("[Network error]", error=str(e))
+                        log_gap()
+
+        page.on("response", _handle_response)
 
         # Session-level metrics
         session_start = time.time()
         session_seen_count = 0
 
-        # Load seen IDs from existing CSV if it exists
-        seen_ids = set()
+        # Load seen URLs from existing CSV if it exists
+        seen_urls = set()
         if os.path.exists(LISTING_URL_CSV):
             try:
                 existing_df = pd.read_csv(LISTING_URL_CSV)
-                if "id" in existing_df.columns:
-                    seen_ids = set(existing_df["id"].dropna().tolist())
+                if "url" in existing_df.columns:
+                    seen_urls = set(existing_df["url"].dropna().tolist())
                 else:
-                    print("No 'id' column found in CSV")
+                    print("No 'url' column found in CSV")
 
-                # Printing the number of found ids
-                print(f"Loaded {len(seen_ids)} seen IDs from {LISTING_URL_CSV}")
+                # Printing the number of found urls
+                print(f"Loaded {len(seen_urls)} seen URLs from {LISTING_URL_CSV}")
 
             except Exception as e:
                 print(f"Error loading {LISTING_URL_CSV}: {e}")
@@ -58,7 +168,10 @@ async def main():
         total_models = len(car_models_makes)
 
         for model_index, car in enumerate(car_models_makes, start=1):
-            print(f"\n=== Starting scraping for {car[0]} {car[1]} ===")
+            log_header(f"Starting scraping for {car[0]} {car[1]}")
+            collect_network = False
+            log_kv("[Network Harvest]", state="disabled (pre-search)")
+            log_gap()
             # ---------------- Navigate to a car listings for each make and model ----------------
             await page.goto("https://www.autotempest.com/")
             await page.wait_for_timeout(random.randint(700, 1400))
@@ -79,7 +192,11 @@ async def main():
             await page.get_by_role("button", name="Search").first.click()
             await page.wait_for_timeout(random.randint(1200, 2000))
 
-            print("Search button pressed")
+            log_kv("[Action]", action="Search pressed")
+            log_gap()
+            collect_network = True
+            log_kv("[Network Harvest]", state="enabled (post-search)")
+            log_gap()
 
             # Wait for the page to load
             await page.wait_for_timeout(random.randint(2500, 4000))
@@ -106,9 +223,10 @@ async def main():
             skipped_no_id = 0  # The number of listings skipped due to missing ID
             skipped_no_href = 0  # The number of listings skipped due to missing href
             skipped_duplicates = 0  # The number of listings skipped due to duplicates
-            seen_dom_ids_this_model = set()  # Initialize a set to track seen DOM IDs for this model. This can include non-saved elements.
-            seen_hrefs_this_model = set()  # Initialize a set to track seen hrefs for this model. This can include non-saved elements.
-            last_processed_idx = -1  # Track highest processed index for safe-overlap pagination. It starts at -1 to ensure the first page is processed.
+            seen_urls_this_model = (
+                set()
+            )  # Initialize a set to track seen URLs for this model (dedupe key).
+            # removed unused last_processed_idx (safe-overlap now driven by network epochs)
             while num_more_results < MAX_PAGES_PER_MODEL:
                 local_results = []
                 # ---------------- Getting a list of all listings ----------------
@@ -128,16 +246,44 @@ async def main():
 
                 # Select result card elements
                 car_elements = page.locator(".ResultItem_cardWrap__tA63Q")
-                print("Using base result selector (.ResultItem_cardWrap__tA63Q).")
+                log_kv("[Results]", selector=".ResultItem_cardWrap__tA63Q")
+                log_gap()
 
                 count = await car_elements.count()
+                # Index-based window removed; we rely solely on network target ids
+                allow_snapshot_all = num_more_results == 0
+                # Determine new-only processing set for this iteration (epoch)
+                _initial_epoch_ids = (
+                    set(harvest_by_epoch.get(current_epoch, [])) - processed_target_ids
+                )
 
-                # Compute start index with safe overlap window
-                start_index = max(0, last_processed_idx - SAFE_OVERLAP)
-                if start_index > 0:
-                    print(
-                        f"[Pagination] Using start_index={start_index} (last_processed_idx={last_processed_idx}, overlap={SAFE_OVERLAP})"
-                    )
+                def _trends_url_from_id(_id: str) -> str:
+                    return f"https://www.autotempest.com/trends/{_id}"
+
+                # Filter out ids we have already seen (based on constructed trends URL)
+                epoch_ids = {
+                    eid
+                    for eid in _initial_epoch_ids
+                    if (_trends_url_from_id(eid) not in seen_urls)
+                    and (_trends_url_from_id(eid) not in seen_urls_this_model)
+                }
+
+                log_kv(
+                    "[Epoch]",
+                    epoch=current_epoch,
+                    allow_snapshot_all=allow_snapshot_all,
+                    epoch_ids=len(epoch_ids),
+                    harvested_buffer_len=len(harvested_buffer),
+                    processed_target_ids=len(processed_target_ids),
+                )
+                log_kv(
+                    "[Epoch filter]",
+                    before=len(_initial_epoch_ids),
+                    after=len(epoch_ids),
+                    filtered=(len(_initial_epoch_ids) - len(epoch_ids)),
+                )
+                print(f"  sample_ids={list(epoch_ids)[:5]}")
+                log_gap()
 
                 # ---------------- Extract the URL from each listing ----------------
                 # Build a stable snapshot of elements to iterate to avoid index drift
@@ -150,35 +296,110 @@ async def main():
                             return { idx, ancestorId: withId ? withId.id : null };
                         })"""
                     )
-                    print(f"Captured card snapshot (len={len(cards_snapshot)})")
+                    log_kv(
+                        "[Snapshot]",
+                        cards=len(cards_snapshot),
+                        epoch_ids_nonempty=len(epoch_ids) > 0,
+                    )
                 except Exception:
                     cards_snapshot = None
                 if cards_snapshot and len(cards_snapshot) > 0:
                     for entry in cards_snapshot:
                         idx = entry.get("idx")
                         ancestor_id = entry.get("ancestorId")
-                        # Only process newly appended indices with a small safe overlap
-                        if idx is None or idx < start_index:
+                        # Only process newly appended indices; after page 1, require membership in epoch_ids
+                        if idx is None:
                             continue
                         if ancestor_id:
+                            # Skip already processed targets to avoid rework
+                            if ancestor_id in processed_target_ids:
+                                continue
+                            if (epoch_ids and ancestor_id in epoch_ids) or (
+                                not epoch_ids and allow_snapshot_all
+                            ):
+                                items.append(
+                                    (
+                                        idx,
+                                        page.locator(
+                                            f'[id="{ancestor_id}"] .ResultItem_cardWrap__tA63Q'
+                                        ).first,
+                                        ancestor_id,
+                                    )
+                                )
+                        else:
+                            if allow_snapshot_all:
+                                items.append((idx, car_elements.nth(idx), None))
+                else:
+                    # No snapshot available; build items directly from target ids if present
+                    target_source = list(harvested_buffer) if allow_snapshot_all else []
+                    if target_source:
+                        for ancestor_id in target_source:
+                            # Skip already processed targets to avoid rework
+                            if ancestor_id in processed_target_ids:
+                                continue
                             items.append(
                                 (
-                                    idx,
+                                    None,
                                     page.locator(
                                         f'[id="{ancestor_id}"] .ResultItem_cardWrap__tA63Q'
                                     ).first,
                                     ancestor_id,
                                 )
                             )
-                        else:
-                            items.append((idx, car_elements.nth(idx), None))
-                else:
-                    for idx in range(start_index, count):
-                        items.append((idx, car_elements.nth(idx), None))
+                    else:
+                        items = []
 
+                sample_ancestors = [s for _, _, s in items[:5]]
+                log_kv(
+                    "[Items]",
+                    epoch=current_epoch,
+                    built=len(items),
+                    from_snapshot=(cards_snapshot is not None),
+                    epoch_ids=len(epoch_ids),
+                )
+                print(f"  sample_epoch_ids={list(epoch_ids)[:5]}")
+                print(f"  sample_ancestors={sample_ancestors}")
+                log_kv(
+                    "[Per-card]",
+                    skipped=(not allow_snapshot_all),
+                    mode=("snapshot" if allow_snapshot_all else "dom-diff"),
+                )
+                log_gap()
                 for i, car_elem, stable_ancestor_id in items:
                     processed_count += 1
                     session_seen_count += 1
+
+                    # Early minimal href extraction for fast duplicate skip (avoid heavy operations)
+                    early_href = None
+                    try:
+                        early_href = await car_elem.evaluate(
+                            """(el) => {
+                                const a = el.querySelector('h3 a, a[href*="/trends/"], a[href]');
+                                return a ? a.getAttribute('href') : null;
+                            }"""
+                        )
+                    except Exception:
+                        early_href = None
+                    if early_href:
+                        early_url = (
+                            early_href
+                            if early_href.startswith("http")
+                            else f"https://www.autotempest.com{early_href}"
+                        )
+                        if early_url in seen_urls_this_model or early_url in seen_urls:
+                            skipped_duplicates += 1
+                            print(f"  - duplicate: {early_url}")
+                            log_kv(
+                                "[Skip]",
+                                card=i,
+                                in_model=(early_url in seen_urls_this_model),
+                                in_session=(early_url in seen_urls),
+                                epoch=current_epoch,
+                            )
+                            if stable_ancestor_id:
+                                processed_target_ids.add(stable_ancestor_id)
+                            continue
+
                     # Detachment guard
                     try:
                         is_detached = await car_elem.count() == 0
@@ -194,7 +415,7 @@ async def main():
                     except Exception:
                         pass
 
-                    # Early ID extraction and duplicate check to avoid re-processing
+                    # Early optional ID extraction (for logging/storage only; URL is the dedupe key)
                     listing_id = None
                     try:
                         listing_id = await car_elem.get_attribute("id")
@@ -209,28 +430,7 @@ async def main():
                             listing_id = None
                     if not listing_id and stable_ancestor_id:
                         listing_id = stable_ancestor_id
-                    # Guard: missing ID (skip early to avoid churn re-processing)
-                    if not listing_id:
-                        skipped_no_id += 1
-                        print(f"[Skip] Card #{i}: missing id")
-                        continue
-
-                    # Skip if we've already seen this ID in this model or previously
-                    if listing_id in seen_dom_ids_this_model:
-                        skipped_duplicates += 1
-                        print(
-                            f"[Skip] Card #{i} id={listing_id}: duplicate within this model (DOM churn)"
-                        )
-                        continue
-                    if listing_id in seen_ids:
-                        skipped_duplicates += 1
-                        print(
-                            f"[Skip] Card #{i} id={listing_id}: duplicate from previous runs"
-                        )
-                        continue
-                    seen_dom_ids_this_model.add(
-                        listing_id
-                    )  # These are just seen ids, not neccesarily saved ids
+                    # Do not skip based on missing or duplicate ID; dedupe happens by URL below
 
                     direct_href = None
                     link_elem = car_elem.locator("h3 a")  # Find <a> inside <h3>
@@ -349,7 +549,13 @@ async def main():
                             )
                         except Exception:
                             href = None
-                    listing_url = f"https://www.autotempest.com{href}" if href else None
+                    if href:
+                        if href.startswith("http"):
+                            listing_url = href
+                        else:
+                            listing_url = f"https://www.autotempest.com{href}"
+                    else:
+                        listing_url = None
 
                     # listing_id already determined by early duplicate check above
 
@@ -357,18 +563,30 @@ async def main():
                     if not href:
                         skipped_no_href += 1
                         print(f"Skipping listing {listing_id}: missing href")
+                        if stable_ancestor_id:
+                            processed_target_ids.add(stable_ancestor_id)
                         continue
 
-                    # Href-based per-model dedupe to mitigate DOM churn
-                    if href in seen_hrefs_this_model:
+                    # URL-based dedupe (per-model and session)
+                    if listing_url in seen_urls_this_model or listing_url in seen_urls:
                         skipped_duplicates += 1
-                        print(
-                            f"[Skip] Card #{i} id={listing_id}: duplicate href on this model page ({href})"
+                        in_model = listing_url in seen_urls_this_model
+                        in_session = listing_url in seen_urls
+                        print(f"  - duplicate: {listing_url}")
+                        log_kv(
+                            "[Skip]",
+                            card=i,
+                            in_model=in_model,
+                            in_session=in_session,
+                            epoch=current_epoch,
                         )
+                        if stable_ancestor_id:
+                            processed_target_ids.add(stable_ancestor_id)
                         continue
-                    seen_hrefs_this_model.add(href)
+                    seen_urls_this_model.add(listing_url)
 
-                    print(f"Listing ID: {listing_id}")
+                    print(f"Card Index: {i}")
+                    print(f"Listing ID (optional): {listing_id}")
                     print(f"Listing URL: {listing_url}")
                     print("\n")
 
@@ -380,10 +598,18 @@ async def main():
                             "url": listing_url,
                         }
                     )
-                    seen_ids.add(listing_id)
+                    seen_urls.add(listing_url)
+                    if stable_ancestor_id:
+                        processed_target_ids.add(stable_ancestor_id)
+                    log_kv(
+                        "[Append: network]",
+                        epoch=current_epoch,
+                        url=listing_url,
+                        id=listing_id,
+                        ancestor=stable_ancestor_id,
+                    )
 
-                # Update last_processed_idx for next iteration and write the data to a file
-                last_processed_idx = count - 1
+                # Write the data to a file (dynamic schema growth)
                 if local_results:
                     # Ensure output directory exists
                     os.makedirs(os.path.dirname(LISTING_URL_CSV), exist_ok=True)
@@ -392,9 +618,13 @@ async def main():
                         LISTING_URL_CSV, mode="a", header=header, index=False
                     )
                     saved_this_model += len(local_results)
-                    print(
-                        f"Saved {len(local_results)} new listings to {LISTING_URL_CSV}"
+                    sample_urls = [r.get("url") for r in local_results[:5]]
+                    log_gap()
+                    log_kv(
+                        "[Save: network]", epoch=current_epoch, count=len(local_results)
                     )
+                    print(f"  file={LISTING_URL_CSV}")
+                    print(f"  sample={sample_urls}")
 
                 # Now that we have gotten the listings on this page we will get the listings on the next page
                 # by clicking the "More Results" button
@@ -415,9 +645,22 @@ async def main():
                 # Click the button and robustly wait for more results to load
                 sel = ".ResultItem_cardWrap__tA63Q"
                 prev_count = await page.locator(sel).count()
-                print(
-                    f"Clicking More Results (prev_count={prev_count}, clicks_so_far={num_more_results})"
+                # Snapshot pre-click hrefs for DOM-diff fallback
+                pre_hrefs = await page.evaluate(
+                    """
+                    Array.from(document.querySelectorAll('.ResultItem_cardWrap__tA63Q a[href]'))
+                        .map(a => a.getAttribute('href'))
+                        .filter(Boolean)
+                    """
                 )
+                log_kv(
+                    "[More Results click]",
+                    prev_count=prev_count,
+                    clicks_so_far=num_more_results,
+                )
+                log_gap()
+                # Start a new harvest epoch for responses triggered by this click
+                current_epoch += 1
                 await more_button.click()
                 await page.wait_for_timeout(
                     random.randint(1200, 2500)
@@ -430,7 +673,7 @@ async def main():
                     )
                 except Exception as e:
                     print(f"No new results detected after clicking More Results: {e}")
-                    break
+                    # Do not break; rely on DOM-diff and network signals below to decide continuation
 
                 # Additional settle loop: wait for card count to stabilize
                 try:
@@ -449,16 +692,107 @@ async def main():
                         else:
                             stable_runs = 0
                             last_count = curr
-                    print(
-                        f"[Pagination] Settled count after More Results: {last_count}"
-                    )
+                    log_kv("[Pagination settled]", count=last_count)
+                    log_gap()
                 except Exception:
                     pass
 
-                # Next loop will use last_processed_idx computed from the page we just processed
-                print(
-                    f"[Pagination] last_processed_idx={last_processed_idx} (prior count processed)"
-                )
+                # Compute DOM href delta for this new epoch as a fallback
+                try:
+                    post_hrefs = await page.evaluate(
+                        """
+                        Array.from(document.querySelectorAll('.ResultItem_cardWrap__tA63Q a[href]'))
+                            .map(a => a.getAttribute('href'))
+                            .filter(Boolean)
+                        """
+                    )
+
+                    def _abs_urls(hrefs):
+                        out = []
+                        for h in hrefs:
+                            if h and h.startswith("http"):
+                                out.append(h)
+                            elif h:
+                                out.append(f"https://www.autotempest.com{h}")
+                        return set(out)
+
+                    dom_deltas_by_epoch[current_epoch] = _abs_urls(
+                        post_hrefs
+                    ) - _abs_urls(pre_hrefs)
+                    log_kv(
+                        "[DOM-Diff]",
+                        epoch=current_epoch,
+                        new_urls=len(dom_deltas_by_epoch[current_epoch]),
+                    )
+                    print(f"  sample={list(dom_deltas_by_epoch[current_epoch])[:5]}")
+                    log_gap()
+                except Exception as e:
+                    dom_deltas_by_epoch[current_epoch] = set()
+                    print(f"[DOM-Diff] error: {e}")
+
+                # Process DOM-delta URLs for this epoch without re-walking cards
+                dom_delta_urls = dom_deltas_by_epoch.get(current_epoch, set())
+                if dom_delta_urls:
+                    to_add = [
+                        u
+                        for u in dom_delta_urls
+                        if u not in seen_urls and u not in seen_urls_this_model
+                    ]
+                    if to_add:
+                        log_kv(
+                            "[DOM-Diff]",
+                            epoch=current_epoch,
+                            total_delta=len(dom_delta_urls),
+                            to_add=len(to_add),
+                            already_seen=(len(dom_delta_urls) - len(to_add)),
+                        )
+                        dom_only_results = [
+                            {"make": car[0], "model": car[1], "id": None, "url": u}
+                            for u in to_add
+                        ]
+                        # Ensure output directory exists
+                        os.makedirs(os.path.dirname(LISTING_URL_CSV), exist_ok=True)
+                        header = not os.path.exists(LISTING_URL_CSV)
+                        pd.DataFrame(dom_only_results).to_csv(
+                            LISTING_URL_CSV, mode="a", header=header, index=False
+                        )
+                        saved_this_model += len(dom_only_results)
+                        processed_count += len(dom_only_results)
+                        session_seen_count += len(dom_only_results)
+                        for u in to_add:
+                            seen_urls.add(u)
+                            seen_urls_this_model.add(u)
+                        sample_dom_urls = [r.get("url") for r in dom_only_results[:5]]
+                        log_gap()
+                        log_kv(
+                            "[Save: dom-delta]",
+                            epoch=current_epoch,
+                            count=len(dom_only_results),
+                        )
+                        print(f"  file={LISTING_URL_CSV}")
+                        print(f"  sample={sample_dom_urls}")
+
+                # Decide continuation based on progress signals (DOM-diff or new epoch ids)
+                dom_delta_count = len(dom_deltas_by_epoch.get(current_epoch, set()))
+                epoch_new_ids = len(harvest_by_epoch.get(current_epoch, []))
+                progress = dom_delta_count > 0 or epoch_new_ids > 0
+                if not progress:
+                    try:
+                        still_visible = await more_button.is_visible()
+                        still_enabled = await more_button.is_enabled()
+                    except Exception:
+                        still_visible = False
+                        still_enabled = False
+                    if not still_visible or not still_enabled:
+                        print(
+                            "[Stop] No progress and button disabled/hidden; ending pagination"
+                        )
+                        break
+                    else:
+                        print(
+                            "[Warn] No progress but button still enabled; continuing to next iteration"
+                        )
+                # Proceed to next iteration; targeting is driven by newly harvested ids
                 num_more_results += 1
                 # Session pagination logging
                 elapsed = time.time() - session_start
