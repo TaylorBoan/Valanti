@@ -2,7 +2,7 @@ import pandas as pd
 import os
 
 # CONFIGURABLE PATH VARIABLE
-CSV_FILE_PATH = 'data.csv'  # Replace with your actual CSV file path
+CSV_FILE_PATH = 'Car Models/listing_urls.csv'  # Replace with your actual CSV file path
 
 def remove_duplicates(file_path):
     """
