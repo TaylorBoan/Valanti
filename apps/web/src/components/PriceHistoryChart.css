@@ -1,0 +1,34 @@
+.chart {
+  width: 100%;
+  background: rgba(15, 23, 42, 0.8);
+  border-radius: 1rem;
+  border: 1px solid var(--border);
+  padding: 1rem;
+}
+
+.chart--loading,
+.chart--empty {
+  display: grid;
+  place-items: center;
+  color: var(--muted-light);
+  height: 360px;
+}
+
+.chart-tooltip {
+  background: rgba(15, 23, 42, 0.95);
+  padding: 0.75rem 1rem;
+  border-radius: 0.75rem;
+  border: 1px solid rgba(59, 130, 246, 0.4);
+  color: #f8fafc;
+  min-width: 180px;
+}
+
+.chart-tooltip__price {
+  font-size: 1.2rem;
+  font-weight: 600;
+}
+
+.chart-tooltip__meta {
+  font-size: 0.85rem;
+  color: var(--muted-light);
+}

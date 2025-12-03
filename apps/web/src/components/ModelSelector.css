@@ -1,0 +1,27 @@
+.model-selector {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 220px;
+}
+
+.model-selector__label {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.model-selector__select {
+  padding: 0.5rem 0.75rem;
+  border-radius: 0.5rem;
+  border: 1px solid var(--border);
+  background: rgba(23, 23, 25, 0.8);
+  color: var(--text, #fff);
+  font-size: 0.95rem;
+}
+
+.model-selector__select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
