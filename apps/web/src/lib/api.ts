@@ -23,8 +23,9 @@ export const api = {
     const result = await request<{ data: ModelDefinition[] }>('/models')
     return result.data
   },
-  getSummaryMetrics(): Promise<SummaryMetrics> {
-    return request('/metrics/summary')
+  getSummaryMetrics(modelKey?: string): Promise<SummaryMetrics> {
+    const params = modelKey ? `?modelKey=${encodeURIComponent(modelKey)}` : ''
+    return request(`/metrics/summary${params}`)
   },
   getPriceHistory(modelKey: string): Promise<PriceHistoryResponse> {
     return request(`/models/${modelKey}/price-history`)

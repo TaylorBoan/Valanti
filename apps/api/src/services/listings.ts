@@ -51,27 +51,56 @@ export const getPriceHistoryForModel = (key: string): Promise<PriceHistoryRespon
     };
   });
 
-export const getSummaryMetrics = (): Promise<SummaryMetrics> =>
-  memoize('summary-metrics', async () => {
+export const getSummaryMetrics = (modelKey?: string): Promise<SummaryMetrics> => {
+  const cacheKey = modelKey ? `summary-metrics:${modelKey}` : 'summary-metrics';
+
+  return memoize(cacheKey, async () => {
     const now = dayjs();
     const currentWindowStart = now.subtract(30, 'day');
     const previousWindowStart = now.subtract(60, 'day');
+    const definition = modelKey ? getModelByKey(modelKey) : undefined;
+
+    if (modelKey && !definition) {
+      throw new Error(`Unknown model key: ${modelKey}`);
+    }
 
     const [totalResult, uniqueVins, currentWindow, previousWindow] = await Promise.all([
       supabase.from(config.listingsTable).select('id', { head: true, count: 'exact' }),
       countDistinct('vin'),
-      supabase
-        .from(config.listingsTable)
-        .select('price,date')
-        .gte('date', currentWindowStart.toISOString())
-        .lte('date', now.toISOString())
-        .limit(METRICS_SAMPLE_LIMIT),
-      supabase
-        .from(config.listingsTable)
-        .select('price,date')
-        .gte('date', previousWindowStart.toISOString())
-        .lt('date', currentWindowStart.toISOString())
-        .limit(METRICS_SAMPLE_LIMIT)
+      (() => {
+        let query = supabase
+          .from(config.listingsTable)
+          .select('price,date')
+          .gte('date', currentWindowStart.toISOString())
+          .lte('date', now.toISOString())
+          .limit(METRICS_SAMPLE_LIMIT);
+
+        definition?.filters?.forEach((filter) => {
+          query =
+            filter.operator === 'eq'
+              ? query.eq(filter.column, filter.value)
+              : query.ilike(filter.column, filter.value);
+        });
+
+        return query;
+      })(),
+      (() => {
+        let query = supabase
+          .from(config.listingsTable)
+          .select('price,date')
+          .gte('date', previousWindowStart.toISOString())
+          .lt('date', currentWindowStart.toISOString())
+          .limit(METRICS_SAMPLE_LIMIT);
+
+        definition?.filters?.forEach((filter) => {
+          query =
+            filter.operator === 'eq'
+              ? query.eq(filter.column, filter.value)
+              : query.ilike(filter.column, filter.value);
+        });
+
+        return query;
+      })()
     ]);
 
     if (totalResult.error) {
@@ -102,6 +131,7 @@ export const getSummaryMetrics = (): Promise<SummaryMetrics> =>
       updatedAt: now.toISOString()
     };
   }, 120);
+};
 
 async function fetchListings(definition: ModelDefinition): Promise<ListingRecord[]> {
   let query = supabase
